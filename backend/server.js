@@ -1,9 +1,21 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const mongoose = require('mongoose');
 const http = require('http');
-require('dotenv').config();
+
+// Import configuration modules
+const { loadEnv, getConfig } = require('./config/env');
+const { connectDB, disconnectDB } = require('./config/database');
+const logger = require('./config/logger');
+const { scheduleBackups } = require('./services/database/backup');
+const { migrate } = require('./services/database/migration');
+
+// Import monitoring system
+const monitoring = require('./monitoring');
+
+// Load environment variables
+loadEnv();
+const config = getConfig();
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -18,7 +30,28 @@ const { initializeSocketServer } = require('./services/webrtc/signaling');
 // Create Express app
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 5000;
+const PORT = config.port;
+
+// Initialize monitoring system with Sentry and logging
+// Must be before other middleware for proper request tracking
+monitoring.initializeMonitoring(app, {
+  // Configure based on environment
+  sentry: process.env.SENTRY_DSN ? true : false,
+  alerts: process.env.ENABLE_ALERTS === 'true',
+  performanceMonitoring: true,
+  statusMonitorConfig: {
+    // Restrict status page access in production
+    authorization: {
+      enable: process.env.NODE_ENV === 'production',
+      users: [
+        {
+          username: process.env.STATUS_PAGE_USERNAME || 'admin',
+          password: process.env.STATUS_PAGE_PASSWORD || 'admin'
+        }
+      ]
+    }
+  }
+});
 
 // Initialize WebRTC signaling
 const io = initializeSocketServer(server);
@@ -29,21 +62,24 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Optional MongoDB connection
-if (process.env.MONGODB_URI) {
+// Connect to MongoDB and initialize services
+const initializeServices = async () => {
   // Connect to MongoDB
-  mongoose.connect(process.env.MONGODB_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  })
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => {
-    console.error('MongoDB connection error:', err);
-    console.log('Running without MongoDB connection');
-  });
-} else {
-  console.log('MONGODB_URI not provided. Running without database connection.');
-}
+  const dbConnected = await connectDB();
+  
+  if (dbConnected) {
+    // Run database migrations
+    const migrationResult = await migrate();
+    if (migrationResult.applied > 0) {
+      monitoring.logger.info(`Applied ${migrationResult.applied} database migrations`);
+    }
+    
+    // Schedule automated backups
+    if (process.env.NODE_ENV === 'production') {
+      scheduleBackups();
+    }
+  }
+};
 
 // Routes
 app.use('/api/auth', authRoutes);
@@ -57,28 +93,56 @@ app.get('/api/webrtc/info', (req, res) => {
   res.json({
     success: true,
     data: {
-      socketUrl: process.env.SOCKET_URL || `http://localhost:${PORT}`,
+      socketUrl: config.webrtc.socketUrl,
       iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ]
+        { urls: config.webrtc.stunServer || 'stun:stun.l.google.com:19302' },
+        config.webrtc.turnServer ? {
+          urls: config.webrtc.turnServer,
+          username: config.webrtc.turnUsername,
+          credential: config.webrtc.turnCredential
+        } : null
+      ].filter(Boolean)
     }
   });
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ 
-    success: false, 
-    message: 'Something went wrong!',
-    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+// Setup error handling middleware
+// This should be after all routes are defined
+monitoring.setupErrorHandlers(app);
+
+// Start the server
+server.listen(PORT, async () => {
+  monitoring.logger.info(`Server running in ${config.env} mode on port ${PORT}`, {
+    port: PORT,
+    env: config.env,
+    nodeVersion: process.version
+  });
+  
+  await initializeServices();
+  
+  // Log application startup with all routes (for documentation)
+  if (app._router && app._router.stack) {
+    monitoring.logger.logAppStartup(app, PORT);
+  }
+});
+
+// Handle shutdown gracefully
+process.on('SIGTERM', () => {
+  monitoring.logger.info('SIGTERM received. Shutting down gracefully...');
+  server.close(async () => {
+    monitoring.logger.info('Server closed.');
+    await disconnectDB();
+    process.exit(0);
   });
 });
 
-// Start the server
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+process.on('SIGINT', () => {
+  monitoring.logger.info('SIGINT received. Shutting down gracefully...');
+  server.close(async () => {
+    monitoring.logger.info('Server closed.');
+    await disconnectDB();
+    process.exit(0);
+  });
 });
 
 module.exports = app; 
